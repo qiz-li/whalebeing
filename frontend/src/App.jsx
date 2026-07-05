@@ -21,16 +21,12 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const geojsonFilePath = "/data/daily_geojsons/2023-06-01.geojson";
-
-
   const geojsonBaseUrl = "/data/daily_geojsons";
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
     setError("");
-    setResponse("");
 
     generateTimeChunks();
 
@@ -57,9 +53,9 @@ function App() {
         return;
       }
 
-      // Fetch whale data from 2023-06-01.geojson
-      const whaleRes = await fetch(geojsonFilePath);
-      if (!whaleRes.ok) throw new Error(`Failed to fetch ${geojsonFilePath}`);
+      const whaleUrl = `${geojsonBaseUrl}/${startDate}.geojson`;
+      const whaleRes = await fetch(whaleUrl);
+      if (!whaleRes.ok) throw new Error(`Failed to fetch ${whaleUrl}`);
       const geojson = await whaleRes.json();
       setWhaleData(geojson.features);
 
