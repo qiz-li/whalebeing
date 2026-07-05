@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS ais_positions (
     sog REAL,
     cog REAL,
     heading REAL,
+    rate_of_turn REAL,
     status INT,
     transceiver_class CHAR(1),
     UNIQUE (vessel_id, base_datetime)
