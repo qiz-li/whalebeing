@@ -16,10 +16,10 @@ from datetime import date, timedelta
 import httpx
 import psycopg
 
-# California coast bounding box (generous to capture offshore shipping lanes)
-CA_BBOX = {
+# West Coast bounding box: Baja approaches → Vancouver/BC
+BBOX = {
     "lat_min": 30.0,
-    "lat_max": 42.0,
+    "lat_max": 51.0,
     "lon_min": -130.0,
     "lon_max": -115.0,
 }
@@ -55,10 +55,13 @@ def insert_batch(conn, rows: list[dict]):
                 vessels_seen[mmsi] = r
 
         # Upsert vessels
-        vessel_values = [
-            (
+        vessel_values = []
+        for v in vessels_seen.values():
+            raw_imo = v.get("IMO") or None
+            imo = None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
+            vessel_values.append((
                 int(v["MMSI"]),
-                v.get("IMO") or None,
+                imo,
                 v.get("VesselName") or None,
                 v.get("CallSign") or None,
                 parse_int(v.get("VesselType", "")),
@@ -66,9 +69,7 @@ def insert_batch(conn, rows: list[dict]):
                 parse_float(v.get("Width", "")),
                 parse_float(v.get("Draft", "")),
                 parse_int(v.get("Cargo", "")),
-            )
-            for v in vessels_seen.values()
-        ]
+            ))
 
         cur.executemany(
             """
@@ -96,6 +97,7 @@ def insert_batch(conn, rows: list[dict]):
                 parse_float(r.get("SOG", "")),
                 parse_float(r.get("COG", "")),
                 parse_float(r.get("Heading", "")),
+                parse_float(r.get("ROT", "")),
                 parse_int(r.get("Status", "")),
                 r.get("TransceiverClass") or None,
             )
@@ -104,13 +106,13 @@ def insert_batch(conn, rows: list[dict]):
 
         cur.executemany(
             """
-            INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, status, transceiver_class)
-            SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s
+            INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status, transceiver_class)
+            SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s, %s
             FROM vessels v WHERE v.mmsi = %s
             ON CONFLICT (vessel_id, base_datetime) DO NOTHING
             """,
             [
-                (r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[0])
+                (r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0])
                 for r in position_values
             ],
         )
@@ -154,8 +156,8 @@ def process_date(target_date: date, conn, verbose: bool = True):
 
                     # Filter to California bounding box
                     if not (
-                        CA_BBOX["lat_min"] <= lat <= CA_BBOX["lat_max"]
-                        and CA_BBOX["lon_min"] <= lon <= CA_BBOX["lon_max"]
+                        BBOX["lat_min"] <= lat <= BBOX["lat_max"]
+                        and BBOX["lon_min"] <= lon <= BBOX["lon_max"]
                     ):
                         continue
 

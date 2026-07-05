@@ -4,13 +4,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import close_pool, init_pool
-from app.routers import area, ships
+from app.routers import area
+from app.services.ais_stream import start_stream, stop_stream
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_pool()
+    start_stream()
     yield
+    stop_stream()
     await close_pool()
 
 
@@ -24,5 +27,4 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(ships.router)
 app.include_router(area.router)
