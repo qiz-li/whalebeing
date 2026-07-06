@@ -45,7 +45,7 @@ def parse_int(val: str) -> int | None:
 
 
 def insert_batch(conn, rows: list[dict]):
-    """Upsert vessels then insert positions."""
+    """Upsert vessels then insert positions using pipelines for speed."""
     with conn.cursor() as cur:
         # Deduplicate vessels by MMSI within this batch
         vessels_seen = {}
@@ -55,67 +55,59 @@ def insert_batch(conn, rows: list[dict]):
                 vessels_seen[mmsi] = r
 
         # Upsert vessels
-        vessel_values = []
-        for v in vessels_seen.values():
-            raw_imo = v.get("IMO") or None
-            imo = None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
-            vessel_values.append((
-                int(v["MMSI"]),
-                imo,
-                v.get("VesselName") or None,
-                v.get("CallSign") or None,
-                parse_int(v.get("VesselType", "")),
-                parse_float(v.get("Length", "")),
-                parse_float(v.get("Width", "")),
-                parse_float(v.get("Draft", "")),
-                parse_int(v.get("Cargo", "")),
-            ))
+        with conn.pipeline():
+            for v in vessels_seen.values():
+                raw_imo = v.get("IMO") or None
+                imo = None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
+                cur.execute(
+                    """
+                    INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (mmsi) DO UPDATE SET
+                        imo = COALESCE(EXCLUDED.imo, vessels.imo),
+                        vessel_name = COALESCE(EXCLUDED.vessel_name, vessels.vessel_name),
+                        call_sign = COALESCE(EXCLUDED.call_sign, vessels.call_sign),
+                        vessel_type = COALESCE(EXCLUDED.vessel_type, vessels.vessel_type),
+                        length = COALESCE(EXCLUDED.length, vessels.length),
+                        width = COALESCE(EXCLUDED.width, vessels.width),
+                        draft = COALESCE(EXCLUDED.draft, vessels.draft)
+                    """,
+                    (
+                        int(v["MMSI"]),
+                        imo,
+                        v.get("VesselName") or None,
+                        v.get("CallSign") or None,
+                        parse_int(v.get("VesselType", "")),
+                        parse_float(v.get("Length", "")),
+                        parse_float(v.get("Width", "")),
+                        parse_float(v.get("Draft", "")),
+                        parse_int(v.get("Cargo", "")),
+                    ),
+                )
 
-        cur.executemany(
-            """
-            INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (mmsi) DO UPDATE SET
-                imo = COALESCE(EXCLUDED.imo, vessels.imo),
-                vessel_name = COALESCE(EXCLUDED.vessel_name, vessels.vessel_name),
-                call_sign = COALESCE(EXCLUDED.call_sign, vessels.call_sign),
-                vessel_type = COALESCE(EXCLUDED.vessel_type, vessels.vessel_type),
-                length = COALESCE(EXCLUDED.length, vessels.length),
-                width = COALESCE(EXCLUDED.width, vessels.width),
-                draft = COALESCE(EXCLUDED.draft, vessels.draft)
-            """,
-            vessel_values,
-        )
-
-        # Insert positions
-        position_values = [
-            (
-                int(r["MMSI"]),
-                r["BaseDateTime"],
-                float(r["LON"]),
-                float(r["LAT"]),
-                parse_float(r.get("SOG", "")),
-                parse_float(r.get("COG", "")),
-                parse_float(r.get("Heading", "")),
-                parse_float(r.get("ROT", "")),
-                parse_int(r.get("Status", "")),
-                r.get("TransceiverClass") or None,
-            )
-            for r in rows
-        ]
-
-        cur.executemany(
-            """
-            INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status, transceiver_class)
-            SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s, %s
-            FROM vessels v WHERE v.mmsi = %s
-            ON CONFLICT (vessel_id, base_datetime) DO NOTHING
-            """,
-            [
-                (r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0])
-                for r in position_values
-            ],
-        )
+        # Insert positions using pipeline (batches round-trips)
+        with conn.pipeline():
+            for r in rows:
+                cur.execute(
+                    """
+                    INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status, transceiver_class)
+                    SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s, %s
+                    FROM vessels v WHERE v.mmsi = %s
+                    ON CONFLICT (vessel_id, base_datetime) DO NOTHING
+                    """,
+                    (
+                        r["BaseDateTime"],
+                        float(r["LON"]),
+                        float(r["LAT"]),
+                        parse_float(r.get("SOG", "")),
+                        parse_float(r.get("COG", "")),
+                        parse_float(r.get("Heading", "")),
+                        parse_float(r.get("ROT", "")),
+                        parse_int(r.get("Status", "")),
+                        r.get("TransceiverClass") or None,
+                        int(r["MMSI"]),
+                    ),
+                )
 
     conn.commit()
 
