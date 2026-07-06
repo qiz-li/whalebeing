@@ -92,7 +92,7 @@ def run():
 
     while True:
         try:
-            with ws_client.connect(AISSTREAM_URL) as websocket:
+            with ws_client.connect(AISSTREAM_URL, close_timeout=10) as websocket:
                 websocket.send(subscribe_msg)
                 logger.info("AISstream connected — streaming West Coast")
 
@@ -136,7 +136,10 @@ def run():
                     except Exception as e:
                         logger.debug(f"Skipping message: {e}")
 
-        except Exception as e:
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutting down")
+            break
+        except BaseException as e:
             logger.warning(f"AISstream disconnected: {e} — reconnecting in 5s")
             time.sleep(5)
 
