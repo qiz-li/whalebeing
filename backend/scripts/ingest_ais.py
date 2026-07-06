@@ -1,6 +1,9 @@
 """
 CLI tool to download and ingest NOAA MarineCadastre AIS data into PostgreSQL.
 
+Uses COPY + staging table with indexes dropped for maximum throughput.
+Downloads are parallelized to keep the network saturated.
+
 Usage:
     python -m scripts.ingest_ais --start-date 2023-06-01 --end-date 2023-06-07
     python -m scripts.ingest_ais --date 2023-06-01
@@ -10,8 +13,11 @@ import argparse
 import csv
 import io
 import tempfile
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from pathlib import Path
 
 import httpx
 import psycopg
@@ -26,13 +32,46 @@ BBOX = {
 
 NOAA_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{month:02d}_{day:02d}.zip"
 
-BATCH_SIZE = 10_000
+STAGING_DDL = """
+CREATE TEMP TABLE IF NOT EXISTS staging_ais (
+    mmsi BIGINT,
+    base_datetime TEXT,
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    sog REAL,
+    cog REAL,
+    heading REAL,
+    rot REAL,
+    status INT,
+    transceiver_class TEXT,
+    imo TEXT,
+    vessel_name TEXT,
+    call_sign TEXT,
+    vessel_type INT,
+    length REAL,
+    width REAL,
+    draft REAL,
+    cargo INT
+);
+"""
+
+INDEXES_TO_DROP = [
+    "idx_positions_geom",
+    "idx_positions_vessel_time",
+    "idx_positions_datetime",
+]
+
+INDEXES_TO_CREATE = [
+    "CREATE INDEX idx_positions_geom ON ais_positions USING GIST (position)",
+    "CREATE INDEX idx_positions_vessel_time ON ais_positions (vessel_id, base_datetime)",
+    "CREATE INDEX idx_positions_datetime ON ais_positions (base_datetime)",
+]
 
 
 def parse_float(val: str) -> float | None:
     try:
         v = float(val)
-        return v if v == v else None  # NaN check
+        return v if v == v else None
     except (ValueError, TypeError):
         return None
 
@@ -44,129 +83,165 @@ def parse_int(val: str) -> int | None:
         return None
 
 
-def insert_batch(conn, rows: list[dict]):
-    """Upsert vessels then insert positions using pipelines for speed."""
-    with conn.cursor() as cur:
-        # Deduplicate vessels by MMSI within this batch
-        vessels_seen = {}
-        for r in rows:
-            mmsi = int(r["MMSI"])
-            if mmsi not in vessels_seen:
-                vessels_seen[mmsi] = r
-
-        # Upsert vessels
-        with conn.pipeline():
-            for v in vessels_seen.values():
-                raw_imo = v.get("IMO") or None
-                imo = None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
-                cur.execute(
-                    """
-                    INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (mmsi) DO UPDATE SET
-                        imo = COALESCE(EXCLUDED.imo, vessels.imo),
-                        vessel_name = COALESCE(EXCLUDED.vessel_name, vessels.vessel_name),
-                        call_sign = COALESCE(EXCLUDED.call_sign, vessels.call_sign),
-                        vessel_type = COALESCE(EXCLUDED.vessel_type, vessels.vessel_type),
-                        length = COALESCE(EXCLUDED.length, vessels.length),
-                        width = COALESCE(EXCLUDED.width, vessels.width),
-                        draft = COALESCE(EXCLUDED.draft, vessels.draft)
-                    """,
-                    (
-                        int(v["MMSI"]),
-                        imo,
-                        v.get("VesselName") or None,
-                        v.get("CallSign") or None,
-                        parse_int(v.get("VesselType", "")),
-                        parse_float(v.get("Length", "")),
-                        parse_float(v.get("Width", "")),
-                        parse_float(v.get("Draft", "")),
-                        parse_int(v.get("Cargo", "")),
-                    ),
-                )
-
-        # Insert positions using pipeline (batches round-trips)
-        with conn.pipeline():
-            for r in rows:
-                cur.execute(
-                    """
-                    INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status, transceiver_class)
-                    SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s, %s
-                    FROM vessels v WHERE v.mmsi = %s
-                    ON CONFLICT (vessel_id, base_datetime) DO NOTHING
-                    """,
-                    (
-                        r["BaseDateTime"],
-                        float(r["LON"]),
-                        float(r["LAT"]),
-                        parse_float(r.get("SOG", "")),
-                        parse_float(r.get("COG", "")),
-                        parse_float(r.get("Heading", "")),
-                        parse_float(r.get("ROT", "")),
-                        parse_int(r.get("Status", "")),
-                        r.get("TransceiverClass") or None,
-                        int(r["MMSI"]),
-                    ),
-                )
-
-    conn.commit()
-
-
-def process_date(target_date: date, conn, verbose: bool = True):
-    """Download and ingest AIS data for a single date."""
+def download_day(target_date: date, dest_dir: Path) -> tuple[date, Path | None]:
+    """Download a single day's zip file. Returns (date, path) or (date, None) on failure."""
     url = NOAA_URL.format(year=target_date.year, month=target_date.month, day=target_date.day)
-
-    if verbose:
-        print(f"Downloading {url}...")
-
-    with tempfile.NamedTemporaryFile(suffix=".zip") as tmp:
+    dest = dest_dir / f"AIS_{target_date}.zip"
+    try:
         with httpx.stream("GET", url, timeout=600, follow_redirects=True) as response:
             response.raise_for_status()
-            for chunk in response.iter_bytes(chunk_size=65536):
-                tmp.write(chunk)
+            with open(dest, "wb") as f:
+                for chunk in response.iter_bytes(chunk_size=131072):
+                    f.write(chunk)
+        return (target_date, dest)
+    except Exception as e:
+        print(f"  Download failed for {target_date}: {e}")
+        return (target_date, None)
 
-        tmp.seek(0)
 
+def filter_to_tsv(zip_path: Path) -> tuple[io.BytesIO, int, int]:
+    """Read zip, filter to bbox, return TSV bytes buffer + row counts."""
+    buf = io.BytesIO()
+    total_rows = 0
+    kept_rows = 0
+
+    with zipfile.ZipFile(zip_path) as zf:
+        csv_name = zf.namelist()[0]
+        with zf.open(csv_name) as csv_file:
+            reader = csv.DictReader(io.TextIOWrapper(csv_file, encoding="utf-8"))
+
+            for row in reader:
+                total_rows += 1
+                lat = parse_float(row.get("LAT", ""))
+                lon = parse_float(row.get("LON", ""))
+
+                if lat is None or lon is None:
+                    continue
+
+                if not (
+                    BBOX["lat_min"] <= lat <= BBOX["lat_max"]
+                    and BBOX["lon_min"] <= lon <= BBOX["lon_max"]
+                ):
+                    continue
+
+                raw_imo = row.get("IMO") or ""
+                imo = "" if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
+
+                line = "\t".join([
+                    str(int(row["MMSI"])),
+                    row["BaseDateTime"],
+                    str(lat),
+                    str(lon),
+                    str(parse_float(row.get("SOG", "")) or ""),
+                    str(parse_float(row.get("COG", "")) or ""),
+                    str(parse_float(row.get("Heading", "")) or ""),
+                    str(parse_float(row.get("ROT", "")) or ""),
+                    str(parse_int(row.get("Status", "")) or ""),
+                    row.get("TransceiverClass") or "",
+                    imo,
+                    row.get("VesselName") or "",
+                    row.get("CallSign") or "",
+                    str(parse_int(row.get("VesselType", "")) or ""),
+                    str(parse_float(row.get("Length", "")) or ""),
+                    str(parse_float(row.get("Width", "")) or ""),
+                    str(parse_float(row.get("Draft", "")) or ""),
+                    str(parse_int(row.get("Cargo", "")) or ""),
+                ]) + "\n"
+                buf.write(line.encode())
+                kept_rows += 1
+
+    buf.seek(0)
+    return buf, kept_rows, total_rows
+
+
+def load_day(conn, target_date: date, zip_path: Path, verbose: bool = True):
+    """Filter and COPY a single day's data into the database."""
+    t0 = time.time()
+
+    tsv_buf, kept_rows, total_rows = filter_to_tsv(zip_path)
+    filter_time = time.time() - t0
+
+    if kept_rows == 0:
         if verbose:
-            print(f"Processing {target_date}...")
+            print(f"  {target_date}: no rows in bbox")
+        return
 
-        with zipfile.ZipFile(tmp) as zf:
-            csv_name = zf.namelist()[0]
-            with zf.open(csv_name) as csv_file:
-                reader = csv.DictReader(io.TextIOWrapper(csv_file, encoding="utf-8"))
-                batch = []
-                total_rows = 0
-                kept_rows = 0
+    t1 = time.time()
+    with conn.transaction():
+        cur = conn.cursor()
+        cur.execute(STAGING_DDL)
+        cur.execute("TRUNCATE staging_ais")
 
-                for row in reader:
-                    total_rows += 1
-                    lat = parse_float(row.get("LAT", ""))
-                    lon = parse_float(row.get("LON", ""))
+        with cur.copy("COPY staging_ais FROM STDIN (FORMAT text)") as copy:
+            copy.write(tsv_buf.getvalue())
 
-                    if lat is None or lon is None:
-                        continue
+        cur.execute("""
+            INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
+            SELECT DISTINCT ON (mmsi)
+                mmsi,
+                NULLIF(imo, ''),
+                NULLIF(vessel_name, ''),
+                NULLIF(call_sign, ''),
+                NULLIF(vessel_type, 0),
+                NULLIF(length, 0),
+                NULLIF(width, 0),
+                NULLIF(draft, 0),
+                NULLIF(cargo, 0)
+            FROM staging_ais
+            ON CONFLICT (mmsi) DO UPDATE SET
+                imo = COALESCE(NULLIF(EXCLUDED.imo, ''), vessels.imo),
+                vessel_name = COALESCE(NULLIF(EXCLUDED.vessel_name, ''), vessels.vessel_name),
+                call_sign = COALESCE(NULLIF(EXCLUDED.call_sign, ''), vessels.call_sign),
+                vessel_type = COALESCE(NULLIF(EXCLUDED.vessel_type, 0), vessels.vessel_type),
+                length = COALESCE(NULLIF(EXCLUDED.length, 0), vessels.length),
+                width = COALESCE(NULLIF(EXCLUDED.width, 0), vessels.width),
+                draft = COALESCE(NULLIF(EXCLUDED.draft, 0), vessels.draft)
+        """)
 
-                    # Filter to California bounding box
-                    if not (
-                        BBOX["lat_min"] <= lat <= BBOX["lat_max"]
-                        and BBOX["lon_min"] <= lon <= BBOX["lon_max"]
-                    ):
-                        continue
+        cur.execute("""
+            INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status, transceiver_class)
+            SELECT
+                v.id,
+                s.base_datetime::timestamp,
+                ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326),
+                NULLIF(s.sog, 0),
+                NULLIF(s.cog, 0),
+                NULLIF(s.heading, 0),
+                NULLIF(s.rot, 0),
+                NULLIF(s.status, 0),
+                NULLIF(s.transceiver_class, '')
+            FROM staging_ais s
+            JOIN vessels v ON v.mmsi = s.mmsi
+            ON CONFLICT (vessel_id, base_datetime) DO NOTHING
+        """)
 
-                    batch.append(row)
-                    kept_rows += 1
-
-                    if len(batch) >= BATCH_SIZE:
-                        insert_batch(conn, batch)
-                        batch = []
-                        if verbose:
-                            print(f"  ... {kept_rows:,} California rows inserted so far")
-
-                if batch:
-                    insert_batch(conn, batch)
+    load_time = time.time() - t1
+    total_time = time.time() - t0
 
     if verbose:
-        print(f"Done: {target_date} — {kept_rows:,} / {total_rows:,} rows kept (California filter)")
+        print(f"  {target_date}: {kept_rows:,}/{total_rows:,} rows — "
+              f"filter:{filter_time:.1f}s load:{load_time:.1f}s total:{total_time:.1f}s")
+
+
+def drop_indexes(conn):
+    """Drop indexes on ais_positions for faster bulk insert."""
+    cur = conn.cursor()
+    for idx in INDEXES_TO_DROP:
+        cur.execute(f"DROP INDEX IF EXISTS {idx}")
+    conn.commit()
+    print("Dropped indexes on ais_positions")
+
+
+def create_indexes(conn):
+    """Recreate indexes on ais_positions after bulk load."""
+    cur = conn.cursor()
+    for ddl in INDEXES_TO_CREATE:
+        print(f"  Creating: {ddl.split(' ON ')[0]}...")
+        t0 = time.time()
+        cur.execute(ddl)
+        conn.commit()
+        print(f"    Done in {time.time() - t0:.1f}s")
+    print("All indexes rebuilt")
 
 
 def main():
@@ -174,6 +249,8 @@ def main():
     parser.add_argument("--date", type=str, help="Single date to ingest (YYYY-MM-DD)")
     parser.add_argument("--start-date", type=str, help="Start of date range (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="End of date range (YYYY-MM-DD)")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel download threads")
+    parser.add_argument("--no-reindex", action="store_true", help="Skip dropping/recreating indexes")
     parser.add_argument(
         "--database-url",
         default="postgresql://postgres:postgres@localhost:5432/whalebeing",
@@ -195,14 +272,86 @@ def main():
         parser.error("Provide --date or both --start-date and --end-date")
         return
 
-    with psycopg.connect(args.database_url) as conn:
-        for d in dates:
-            try:
-                process_date(d, conn)
-            except httpx.HTTPStatusError as e:
-                print(f"Failed to download {d}: {e}")
-            except Exception as e:
-                print(f"Error processing {d}: {e}")
+    conn = psycopg.connect(args.database_url)
+
+    # Drop indexes for bulk load speed
+    if not args.no_reindex and len(dates) > 1:
+        drop_indexes(conn)
+
+    # Create temp dir for downloads
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ais_ingest_"))
+    print(f"Download dir: {tmp_dir}")
+    print(f"Ingesting {len(dates)} days with {args.workers} download workers...")
+
+    t_start = time.time()
+    days_done = 0
+
+    # Pipeline: download ahead while loading
+    download_queue = list(dates)
+    pending_downloads = {}
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        # Seed initial downloads
+        batch_size = min(args.workers * 2, len(download_queue))
+        for d in download_queue[:batch_size]:
+            fut = executor.submit(download_day, d, tmp_dir)
+            pending_downloads[fut] = d
+        next_download_idx = batch_size
+
+        # Process as downloads complete, maintaining order
+        ready_files = {}
+
+        for fut in as_completed(pending_downloads):
+            d, path = fut.result()
+            ready_files[d] = path
+
+            # Submit more downloads to keep pipeline full
+            if next_download_idx < len(download_queue):
+                next_d = download_queue[next_download_idx]
+                new_fut = executor.submit(download_day, next_d, tmp_dir)
+                pending_downloads[new_fut] = next_d
+                next_download_idx += 1
+
+            # Load any consecutive ready days in order
+            while download_queue and download_queue[0] in ready_files:
+                load_date = download_queue.pop(0)
+                zip_path = ready_files.pop(load_date)
+
+                if zip_path is None:
+                    print(f"  {load_date}: skipped (download failed)")
+                    days_done += 1
+                    continue
+
+                try:
+                    load_day(conn, load_date, zip_path)
+                except Exception as e:
+                    print(f"  {load_date}: ERROR — {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Clean up zip after loading
+                zip_path.unlink(missing_ok=True)
+                days_done += 1
+
+                if days_done % 10 == 0:
+                    elapsed = time.time() - t_start
+                    rate = elapsed / days_done
+                    remaining = rate * (len(dates) - days_done)
+                    print(f"--- Progress: {days_done}/{len(dates)} days, "
+                          f"{elapsed/60:.1f}min elapsed, ~{remaining/60:.1f}min remaining ---")
+
+    # Rebuild indexes
+    if not args.no_reindex and len(dates) > 1:
+        print("Rebuilding indexes...")
+        create_indexes(conn)
+
+    conn.close()
+    total_time = time.time() - t_start
+    print(f"\nDone! {days_done} days in {total_time/60:.1f} minutes ({total_time/3600:.1f} hours)")
+
+    # Cleanup temp dir
+    import shutil
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
