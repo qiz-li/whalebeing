@@ -12,10 +12,10 @@ Usage:
 import argparse
 import csv
 import io
+import sys
 import tempfile
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -243,7 +243,6 @@ def main():
     parser.add_argument("--date", type=str, help="Single date to ingest (YYYY-MM-DD)")
     parser.add_argument("--start-date", type=str, help="Start of date range (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="End of date range (YYYY-MM-DD)")
-    parser.add_argument("--workers", type=int, default=4, help="Parallel download threads")
     parser.add_argument("--no-reindex", action="store_true", help="Skip dropping/recreating indexes")
     parser.add_argument(
         "--database-url",
@@ -272,67 +271,37 @@ def main():
     if not args.no_reindex and len(dates) > 1:
         drop_indexes(conn)
 
-    # Create temp dir for downloads
     tmp_dir = Path(tempfile.mkdtemp(prefix="ais_ingest_"))
-    print(f"Download dir: {tmp_dir}")
-    print(f"Ingesting {len(dates)} days with {args.workers} download workers...")
+    print(f"Ingesting {len(dates)} days...")
+    sys.stdout.flush()
 
     t_start = time.time()
     days_done = 0
 
-    # Pipeline: download ahead while loading
-    download_queue = list(dates)
-    pending_downloads = {}
-
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        # Seed initial downloads
-        batch_size = min(args.workers * 2, len(download_queue))
-        for d in download_queue[:batch_size]:
-            fut = executor.submit(download_day, d, tmp_dir)
-            pending_downloads[fut] = d
-        next_download_idx = batch_size
-
-        # Process as downloads complete, maintaining order
-        ready_files = {}
-
-        for fut in as_completed(pending_downloads):
-            d, path = fut.result()
-            ready_files[d] = path
-
-            # Submit more downloads to keep pipeline full
-            if next_download_idx < len(download_queue):
-                next_d = download_queue[next_download_idx]
-                new_fut = executor.submit(download_day, next_d, tmp_dir)
-                pending_downloads[new_fut] = next_d
-                next_download_idx += 1
-
-            # Load any consecutive ready days in order
-            while download_queue and download_queue[0] in ready_files:
-                load_date = download_queue.pop(0)
-                zip_path = ready_files.pop(load_date)
-
-                if zip_path is None:
-                    print(f"  {load_date}: skipped (download failed)")
-                    days_done += 1
-                    continue
-
-                try:
-                    load_day(conn, load_date, zip_path)
-                except Exception as e:
-                    print(f"  {load_date}: ERROR — {e}")
-                    import traceback
-                    traceback.print_exc()
-
-                # Clean up zip after loading
-                zip_path.unlink(missing_ok=True)
+    for d in dates:
+        try:
+            _, path = download_day(d, tmp_dir)
+            if path is None:
+                print(f"  {d}: skipped (download failed)")
                 days_done += 1
+                continue
+            load_day(conn, d, path)
+            path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"  {d}: ERROR — {e}")
+            import traceback
+            traceback.print_exc()
 
-                if days_done % 10 == 0:
-                    elapsed = time.time() - t_start
-                    rate = elapsed / days_done
-                    remaining = rate * (len(dates) - days_done)
-                    print(f"--- Progress: {days_done}/{len(dates)} days, "
-                          f"{elapsed/60:.1f}min elapsed, ~{remaining/60:.1f}min remaining ---")
+        days_done += 1
+        sys.stdout.flush()
+
+        if days_done % 10 == 0:
+            elapsed = time.time() - t_start
+            rate = elapsed / days_done
+            remaining = rate * (len(dates) - days_done)
+            print(f"--- Progress: {days_done}/{len(dates)} days, "
+                  f"{elapsed/60:.1f}min elapsed, ~{remaining/60:.1f}min remaining ---")
+            sys.stdout.flush()
 
     # Rebuild indexes
     if not args.no_reindex and len(dates) > 1:
