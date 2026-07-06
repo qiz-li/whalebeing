@@ -92,7 +92,7 @@ def run():
 
     while True:
         try:
-            with ws_client.connect(AISSTREAM_URL, close_timeout=10) as websocket:
+            with ws_client.connect(AISSTREAM_URL, close_timeout=10, ping_interval=None) as websocket:
                 websocket.send(subscribe_msg)
                 logger.info("AISstream connected — streaming West Coast")
 
