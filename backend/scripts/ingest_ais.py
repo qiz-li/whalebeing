@@ -90,20 +90,27 @@ def tsv_val(val) -> str:
     return str(val)
 
 
-def download_day(target_date: date, dest_dir: Path) -> tuple[date, Path | None]:
-    """Download a single day's zip file. Returns (date, path) or (date, None) on failure."""
+def download_day(target_date: date, dest_dir: Path, retries: int = 3) -> tuple[date, Path | None]:
+    """Download a single day's zip file with retries. Returns (date, path) or (date, None) on failure."""
     url = NOAA_URL.format(year=target_date.year, month=target_date.month, day=target_date.day)
     dest = dest_dir / f"AIS_{target_date}.zip"
-    try:
-        with httpx.stream("GET", url, timeout=600, follow_redirects=True) as response:
-            response.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in response.iter_bytes(chunk_size=131072):
-                    f.write(chunk)
-        return (target_date, dest)
-    except Exception as e:
-        print(f"  Download failed for {target_date}: {e}")
-        return (target_date, None)
+    for attempt in range(retries):
+        try:
+            with httpx.stream("GET", url, timeout=600, follow_redirects=True) as response:
+                response.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in response.iter_bytes(chunk_size=131072):
+                        f.write(chunk)
+            return (target_date, dest)
+        except Exception as e:
+            dest.unlink(missing_ok=True)
+            if attempt < retries - 1:
+                wait = 30 * (attempt + 1)
+                print(f"  Download failed for {target_date} (attempt {attempt+1}): {e} — retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                print(f"  Download failed for {target_date} after {retries} attempts: {e}")
+    return (target_date, None)
 
 
 def filter_to_tsv(zip_path: Path) -> tuple[io.BytesIO, int, int]:
