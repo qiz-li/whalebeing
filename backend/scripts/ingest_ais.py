@@ -83,6 +83,13 @@ def parse_int(val: str) -> int | None:
         return None
 
 
+def tsv_val(val) -> str:
+    """Format a value for PostgreSQL COPY text format. None becomes \\N."""
+    if val is None:
+        return "\\N"
+    return str(val)
+
+
 def download_day(target_date: date, dest_dir: Path) -> tuple[date, Path | None]:
     """Download a single day's zip file. Returns (date, path) or (date, None) on failure."""
     url = NOAA_URL.format(year=target_date.year, month=target_date.month, day=target_date.day)
@@ -125,27 +132,27 @@ def filter_to_tsv(zip_path: Path) -> tuple[io.BytesIO, int, int]:
                     continue
 
                 raw_imo = row.get("IMO") or ""
-                imo = "" if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
+                imo = None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
 
                 line = "\t".join([
                     str(int(row["MMSI"])),
                     row["BaseDateTime"],
                     str(lat),
                     str(lon),
-                    str(parse_float(row.get("SOG", "")) or ""),
-                    str(parse_float(row.get("COG", "")) or ""),
-                    str(parse_float(row.get("Heading", "")) or ""),
-                    str(parse_float(row.get("ROT", "")) or ""),
-                    str(parse_int(row.get("Status", "")) or ""),
-                    row.get("TransceiverClass") or "",
-                    imo,
-                    row.get("VesselName") or "",
-                    row.get("CallSign") or "",
-                    str(parse_int(row.get("VesselType", "")) or ""),
-                    str(parse_float(row.get("Length", "")) or ""),
-                    str(parse_float(row.get("Width", "")) or ""),
-                    str(parse_float(row.get("Draft", "")) or ""),
-                    str(parse_int(row.get("Cargo", "")) or ""),
+                    tsv_val(parse_float(row.get("SOG", ""))),
+                    tsv_val(parse_float(row.get("COG", ""))),
+                    tsv_val(parse_float(row.get("Heading", ""))),
+                    tsv_val(parse_float(row.get("ROT", ""))),
+                    tsv_val(parse_int(row.get("Status", ""))),
+                    row.get("TransceiverClass") or "\\N",
+                    tsv_val(imo),
+                    row.get("VesselName") or "\\N",
+                    row.get("CallSign") or "\\N",
+                    tsv_val(parse_int(row.get("VesselType", ""))),
+                    tsv_val(parse_float(row.get("Length", ""))),
+                    tsv_val(parse_float(row.get("Width", ""))),
+                    tsv_val(parse_float(row.get("Draft", ""))),
+                    tsv_val(parse_int(row.get("Cargo", ""))),
                 ]) + "\n"
                 buf.write(line.encode())
                 kept_rows += 1
@@ -178,24 +185,16 @@ def load_day(conn, target_date: date, zip_path: Path, verbose: bool = True):
         cur.execute("""
             INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
             SELECT DISTINCT ON (mmsi)
-                mmsi,
-                NULLIF(imo, ''),
-                NULLIF(vessel_name, ''),
-                NULLIF(call_sign, ''),
-                NULLIF(vessel_type, 0),
-                NULLIF(length, 0),
-                NULLIF(width, 0),
-                NULLIF(draft, 0),
-                NULLIF(cargo, 0)
+                mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo
             FROM staging_ais
             ON CONFLICT (mmsi) DO UPDATE SET
-                imo = COALESCE(NULLIF(EXCLUDED.imo, ''), vessels.imo),
-                vessel_name = COALESCE(NULLIF(EXCLUDED.vessel_name, ''), vessels.vessel_name),
-                call_sign = COALESCE(NULLIF(EXCLUDED.call_sign, ''), vessels.call_sign),
-                vessel_type = COALESCE(NULLIF(EXCLUDED.vessel_type, 0), vessels.vessel_type),
-                length = COALESCE(NULLIF(EXCLUDED.length, 0), vessels.length),
-                width = COALESCE(NULLIF(EXCLUDED.width, 0), vessels.width),
-                draft = COALESCE(NULLIF(EXCLUDED.draft, 0), vessels.draft)
+                imo = COALESCE(EXCLUDED.imo, vessels.imo),
+                vessel_name = COALESCE(EXCLUDED.vessel_name, vessels.vessel_name),
+                call_sign = COALESCE(EXCLUDED.call_sign, vessels.call_sign),
+                vessel_type = COALESCE(EXCLUDED.vessel_type, vessels.vessel_type),
+                length = COALESCE(EXCLUDED.length, vessels.length),
+                width = COALESCE(EXCLUDED.width, vessels.width),
+                draft = COALESCE(EXCLUDED.draft, vessels.draft)
         """)
 
         cur.execute("""
@@ -204,12 +203,7 @@ def load_day(conn, target_date: date, zip_path: Path, verbose: bool = True):
                 v.id,
                 s.base_datetime::timestamp,
                 ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326),
-                NULLIF(s.sog, 0),
-                NULLIF(s.cog, 0),
-                NULLIF(s.heading, 0),
-                NULLIF(s.rot, 0),
-                NULLIF(s.status, 0),
-                NULLIF(s.transceiver_class, '')
+                s.sog, s.cog, s.heading, s.rot, s.status, s.transceiver_class
             FROM staging_ais s
             JOIN vessels v ON v.mmsi = s.mmsi
             ON CONFLICT (vessel_id, base_datetime) DO NOTHING
