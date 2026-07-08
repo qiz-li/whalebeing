@@ -11,10 +11,24 @@ Query with DuckDB, e.g.:
     SELECT * FROM read_parquet('s3://bucket/ais/source=*/year=*/*.parquet')
 """
 
+import io
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+_s3_client = None
+
+
+def _s3():
+    """Lazily create and cache a boto3 S3 client (kept optional so local-dir
+    archives don't require boto3 to be installed)."""
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+
+        _s3_client = boto3.client("s3")
+    return _s3_client
 
 SCHEMA = pa.schema([
     ("mmsi", pa.int64()),
@@ -51,11 +65,9 @@ def new_column_buffers() -> dict[str, list]:
 def store_file(local_path: Path, archive_uri: str, rel_key: str) -> str:
     """Move a finished Parquet file into the archive. Returns the destination URI."""
     if archive_uri.startswith("s3://"):
-        import boto3
-
         bucket, _, prefix = archive_uri[5:].partition("/")
         key = f"{prefix.rstrip('/')}/{rel_key}" if prefix else rel_key
-        boto3.client("s3").upload_file(str(local_path), bucket, key)
+        _s3().upload_file(str(local_path), bucket, key)
         local_path.unlink()
         return f"s3://{bucket}/{key}"
 
@@ -68,11 +80,7 @@ def store_file(local_path: Path, archive_uri: str, rel_key: str) -> str:
 def parquet_row_count(uri: str) -> int:
     """Row count of one archived Parquet file (reads footer metadata only)."""
     if uri.startswith("s3://"):
-        import boto3
-
         bucket, _, key = uri[5:].partition("/")
-        import io
-
-        obj = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+        obj = _s3().get_object(Bucket=bucket, Key=key)
         return pq.ParquetFile(io.BytesIO(obj["Body"].read())).metadata.num_rows
     return pq.ParquetFile(uri).metadata.num_rows

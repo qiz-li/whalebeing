@@ -19,9 +19,11 @@ Usage:
 import argparse
 import csv
 import io
+import shutil
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -36,14 +38,7 @@ from scripts.archive import (
     parquet_row_count,
     store_file,
 )
-
-# West Coast bounding box: Baja approaches → Vancouver/BC
-BBOX = {
-    "lat_min": 30.0,
-    "lat_max": 51.0,
-    "lon_min": -130.0,
-    "lon_max": -115.0,
-}
+from scripts.constants import DEFAULT_DATABASE_URL, in_bbox
 
 NOAA_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{month:02d}_{day:02d}.zip"
 
@@ -85,13 +80,6 @@ def parse_int(val: str) -> int | None:
         return int(float(val))
     except (ValueError, TypeError):
         return None
-
-
-def tsv_val(val) -> str:
-    """Format a value for PostgreSQL COPY text format. None becomes \\N."""
-    if val is None:
-        return "\\N"
-    return str(val)
 
 
 def download_day(target_date: date, dest_dir: Path, retries: int = 3) -> tuple[date, Path | None]:
@@ -151,10 +139,7 @@ def filter_day(zip_path: Path, parquet_path: Path) -> tuple[dict, dict, int, int
                 if lat is None or lon is None:
                     continue
 
-                if not (
-                    BBOX["lat_min"] <= lat <= BBOX["lat_max"]
-                    and BBOX["lon_min"] <= lon <= BBOX["lon_max"]
-                ):
+                if not in_bbox(lat, lon):
                     continue
 
                 try:
@@ -212,30 +197,21 @@ def load_day(conn, vessels: dict, hourly: dict):
         cur.execute(STAGING_DDL)
         cur.execute("TRUNCATE staging_vessels, staging_hourly")
 
-        with cur.copy("COPY staging_vessels FROM STDIN (FORMAT text)") as copy:
+        # write_row adapts and escapes each value, so text fields containing
+        # tabs/newlines/backslashes (vessel names, call signs) can't corrupt the stream.
+        with cur.copy(
+            "COPY staging_vessels (mmsi, imo, vessel_name, call_sign, vessel_type,"
+            " length, width, draft, cargo) FROM STDIN"
+        ) as copy:
             for mmsi, v in vessels.items():
-                copy.write("\t".join([
-                    str(mmsi),
-                    tsv_val(v["imo"]),
-                    tsv_val(v["vessel_name"]),
-                    tsv_val(v["call_sign"]),
-                    tsv_val(v["vessel_type"]),
-                    tsv_val(v["length"]),
-                    tsv_val(v["width"]),
-                    tsv_val(v["draft"]),
-                    tsv_val(v["cargo"]),
-                ]) + "\n")
+                copy.write_row((
+                    mmsi, v["imo"], v["vessel_name"], v["call_sign"],
+                    v["vessel_type"], v["length"], v["width"], v["draft"], v["cargo"],
+                ))
 
-        with cur.copy("COPY staging_hourly FROM STDIN (FORMAT text)") as copy:
+        with cur.copy("COPY staging_hourly (mmsi, hour, lon, lat, sog, cog) FROM STDIN") as copy:
             for (mmsi, hour), (_, lon, lat, sog, cog) in hourly.items():
-                copy.write("\t".join([
-                    str(mmsi),
-                    hour.isoformat(),
-                    str(lon),
-                    str(lat),
-                    tsv_val(sog),
-                    tsv_val(cog),
-                ]) + "\n")
+                copy.write_row((mmsi, hour, lon, lat, sog, cog))
 
         cur.execute("""
             INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
@@ -303,7 +279,7 @@ def main():
     )
     parser.add_argument(
         "--database-url",
-        default="postgresql://postgres:postgres@localhost:5432/whalebeing",
+        default=DEFAULT_DATABASE_URL,
         help="PostgreSQL connection string",
     )
     args = parser.parse_args()
@@ -342,7 +318,6 @@ def main():
             path.unlink(missing_ok=True)
         except Exception as e:
             print(f"  {d}: ERROR — {e}")
-            import traceback
             traceback.print_exc()
 
         days_done += 1
@@ -360,7 +335,6 @@ def main():
     total_time = time.time() - t_start
     print(f"\nDone! {days_done} days in {total_time/60:.1f} minutes ({total_time/3600:.1f} hours)")
 
-    import shutil
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

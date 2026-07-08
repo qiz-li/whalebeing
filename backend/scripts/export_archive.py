@@ -30,6 +30,7 @@ from scripts.archive import (
     parquet_row_count,
     store_file,
 )
+from scripts.constants import DEFAULT_DATABASE_URL
 
 FETCH_ROWS = 100_000
 
@@ -125,9 +126,7 @@ def main():
     parser.add_argument("--retain-days", type=int, default=30)
     parser.add_argument(
         "--database-url",
-        default=os.environ.get(
-            "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/whalebeing"
-        ),
+        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
         help="PostgreSQL connection string (defaults to $DATABASE_URL)",
     )
     args = parser.parse_args()

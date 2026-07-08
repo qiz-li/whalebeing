@@ -21,20 +21,20 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 import websockets.sync.client as ws_client
+
+from scripts.constants import AISSTREAM_BBOX, DEFAULT_DATABASE_URL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
-WEST_COAST_BBOX = [[[30, -130], [51, -115]]]
+HEADING_UNAVAILABLE = 511  # AIS sentinel for "no heading data"
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/whalebeing"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
 API_KEY = os.environ.get("AISSTREAM_API_KEY", "")
 
 
@@ -47,23 +47,26 @@ def parse_timestamp(time_str: str) -> datetime:
             clean = f"{date_part}.{frac}"
         return datetime.strptime(clean, "%Y-%m-%d %H:%M:%S.%f")
     except (ValueError, AttributeError, IndexError):
-        return datetime.utcnow()
+        return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def upsert_vessel(cur, mmsi: int, name: str | None):
+def upsert_vessel(cur, mmsi: int, name: str | None) -> int:
+    """Upsert the vessel and return its id (resolved once, reused for all inserts)."""
     cur.execute(
         """
         INSERT INTO vessels (mmsi, vessel_name)
         VALUES (%s, %s)
         ON CONFLICT (mmsi) DO UPDATE SET
             vessel_name = COALESCE(EXCLUDED.vessel_name, vessels.vessel_name)
+        RETURNING id
         """,
         (mmsi, name),
     )
+    return cur.fetchone()[0]
 
 
 def insert_position(
-    cur, mmsi: int, lat: float, lon: float,
+    cur, vessel_id: int, lat: float, lon: float,
     sog: float | None, cog: float | None,
     heading: float | None, rate_of_turn: float | None,
     status: int | None, timestamp: datetime,
@@ -71,28 +74,25 @@ def insert_position(
     cur.execute(
         """
         INSERT INTO ais_positions_recent (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status)
-        SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s
-        FROM vessels v WHERE v.mmsi = %s
+        VALUES (%s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s)
         ON CONFLICT (vessel_id, base_datetime) DO NOTHING
         """,
-        (timestamp, lon, lat, sog, cog, heading, rate_of_turn, status, mmsi),
+        (vessel_id, timestamp, lon, lat, sog, cog, heading, rate_of_turn, status),
     )
 
     cur.execute(
         """
         INSERT INTO hourly_positions (vessel_id, hour, position, sog, cog)
-        SELECT v.id, date_trunc('hour', %s::timestamp), ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s
-        FROM vessels v WHERE v.mmsi = %s
+        VALUES (%s, date_trunc('hour', %s::timestamp), ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s)
         ON CONFLICT (vessel_id, hour) DO NOTHING
         """,
-        (timestamp, lon, lat, sog, cog, mmsi),
+        (vessel_id, timestamp, lon, lat, sog, cog),
     )
 
     cur.execute(
         """
         INSERT INTO latest_positions (vessel_id, base_datetime, position, sog, cog, heading)
-        SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s
-        FROM vessels v WHERE v.mmsi = %s
+        VALUES (%s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s)
         ON CONFLICT (vessel_id) DO UPDATE SET
             base_datetime = EXCLUDED.base_datetime,
             position = EXCLUDED.position,
@@ -101,7 +101,7 @@ def insert_position(
             heading = EXCLUDED.heading
         WHERE EXCLUDED.base_datetime > latest_positions.base_datetime
         """,
-        (timestamp, lon, lat, sog, cog, heading, mmsi),
+        (vessel_id, timestamp, lon, lat, sog, cog, heading),
     )
 
 
@@ -112,69 +112,94 @@ def run():
 
     subscribe_msg = json.dumps({
         "APIKey": API_KEY,
-        "BoundingBoxes": WEST_COAST_BBOX,
+        "BoundingBoxes": AISSTREAM_BBOX,
         "FilterMessageTypes": ["PositionReport"],
     })
 
-    conn = psycopg.connect(DATABASE_URL, autocommit=True)
-    logger.info("Connected to database")
-
-    batch_count = 0
+    conn = None
+    processed = 0
 
     while True:
         try:
+            if conn is None or conn.closed:
+                conn = psycopg.connect(DATABASE_URL, autocommit=True)
+                logger.info("Connected to database")
+
             with ws_client.connect(AISSTREAM_URL, close_timeout=10, ping_interval=None) as websocket:
                 websocket.send(subscribe_msg)
                 logger.info("AISstream connected — streaming West Coast")
 
                 for raw in websocket:
+                    fields = parse_message(raw)
+                    if fields is None:
+                        continue
                     try:
-                        msg = json.loads(raw)
-                        meta = msg.get("MetaData", {})
-                        position = msg.get("Message", {}).get("PositionReport", {})
-
-                        if not position:
-                            continue
-
-                        mmsi = int(meta.get("MMSI", 0))
-                        if mmsi == 0:
-                            continue
-
-                        lat = position.get("Latitude")
-                        lon = position.get("Longitude")
-                        if lat is None or lon is None:
-                            continue
-
-                        sog = position.get("Sog")
-                        cog = position.get("Cog")
-                        heading_raw = position.get("TrueHeading")
-                        heading = float(heading_raw) if heading_raw is not None and heading_raw != 511 else None
-                        rot_raw = position.get("RateOfTurn")
-                        rate_of_turn = float(rot_raw) if rot_raw is not None else None
-                        status = position.get("NavigationalStatus")
-                        name = meta.get("ShipName", "").strip() or None
-
-                        timestamp = parse_timestamp(meta.get("time_utc", ""))
-
                         with conn.transaction():
                             with conn.cursor() as cur:
-                                upsert_vessel(cur, mmsi, name)
-                                insert_position(cur, mmsi, lat, lon, sog, cog, heading, rate_of_turn, status, timestamp)
+                                vessel_id = upsert_vessel(cur, fields["mmsi"], fields["name"])
+                                insert_position(
+                                    cur, vessel_id, fields["lat"], fields["lon"],
+                                    fields["sog"], fields["cog"], fields["heading"],
+                                    fields["rate_of_turn"], fields["status"], fields["timestamp"],
+                                )
+                    except psycopg.Error as e:
+                        # A dead/broken DB connection must not silently drop every
+                        # message: reconnect (via the outer loop) instead of swallowing.
+                        logger.warning(f"DB write failed: {e} — reconnecting")
+                        conn.close()
+                        conn = None
+                        raise
 
-                        batch_count += 1
-                        if batch_count % 1000 == 0:
-                            logger.info(f"Processed {batch_count} positions")
-
-                    except Exception as e:
-                        logger.debug(f"Skipping message: {e}")
+                    processed += 1
+                    if processed % 1000 == 0:
+                        logger.info(f"Processed {processed} positions")
 
         except (KeyboardInterrupt, SystemExit):
             logger.info("Shutting down")
             break
-        except BaseException as e:
-            logger.warning(f"AISstream disconnected: {e} — reconnecting in 5s")
+        except Exception as e:
+            logger.warning(f"Stream/DB interrupted: {e} — reconnecting in 5s")
             time.sleep(5)
-    conn.close()
+
+    if conn is not None:
+        conn.close()
+
+
+def parse_message(raw) -> dict | None:
+    """Parse one AISstream frame into insert fields, or None to skip it."""
+    try:
+        msg = json.loads(raw)
+        position = msg.get("Message", {}).get("PositionReport", {})
+        if not position:
+            return None
+        meta = msg.get("MetaData", {})
+        mmsi = int(meta.get("MMSI", 0))
+        if mmsi == 0:
+            return None
+        lat = position.get("Latitude")
+        lon = position.get("Longitude")
+        if lat is None or lon is None:
+            return None
+
+        heading_raw = position.get("TrueHeading")
+        heading = float(heading_raw) if heading_raw not in (None, HEADING_UNAVAILABLE) else None
+        rot_raw = position.get("RateOfTurn")
+
+        return {
+            "mmsi": mmsi,
+            "lat": lat,
+            "lon": lon,
+            "sog": position.get("Sog"),
+            "cog": position.get("Cog"),
+            "heading": heading,
+            "rate_of_turn": float(rot_raw) if rot_raw is not None else None,
+            "status": position.get("NavigationalStatus"),
+            "name": meta.get("ShipName", "").strip() or None,
+            "timestamp": parse_timestamp(meta.get("time_utc", "")),
+        }
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        logger.debug(f"Skipping malformed message: {e}")
+        return None
 
 
 if __name__ == "__main__":

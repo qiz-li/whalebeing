@@ -13,6 +13,8 @@ not in PostgreSQL.
 import argparse
 import psycopg
 
+from scripts.constants import DEFAULT_DATABASE_URL
+
 DDL = """
 CREATE EXTENSION IF NOT EXISTS postgis;
 
@@ -72,7 +74,7 @@ def main():
     parser = argparse.ArgumentParser(description="Initialize the WhaleBeing database")
     parser.add_argument(
         "--database-url",
-        default="postgresql://postgres:postgres@localhost:5432/whalebeing",
+        default=DEFAULT_DATABASE_URL,
         help="PostgreSQL connection string",
     )
     args = parser.parse_args()
