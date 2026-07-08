@@ -1,0 +1,4 @@
+# Extra dependencies for the ingest/archive scripts (not needed by the API).
+# Install alongside requirements.txt:  pip install -r requirements.txt -r requirements-scripts.txt
+pyarrow>=17.0.0
+boto3>=1.34.0

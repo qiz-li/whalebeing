@@ -21,7 +21,7 @@ async def get_vessel_trail(mmsi: int, hours: int = 3) -> list[dict]:
     query = """
         SELECT ST_X(p.position) AS lon, ST_Y(p.position) AS lat,
                p.base_datetime, p.sog, p.cog, p.heading
-        FROM ais_positions p
+        FROM ais_positions_recent p
         JOIN vessels v ON p.vessel_id = v.id
         WHERE v.mmsi = $1
           AND p.base_datetime >= $2
@@ -37,14 +37,12 @@ async def get_live_ships(minutes: int = 5) -> list[dict]:
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=minutes)
 
     query = """
-        SELECT DISTINCT ON (p.vessel_id)
-               v.mmsi, v.imo, v.vessel_name, v.vessel_type,
+        SELECT v.mmsi, v.imo, v.vessel_name, v.vessel_type,
                ST_X(p.position) AS lon, ST_Y(p.position) AS lat,
                p.base_datetime, p.sog, p.cog, p.heading
-        FROM ais_positions p
+        FROM latest_positions p
         JOIN vessels v ON p.vessel_id = v.id
         WHERE p.base_datetime >= $1
-        ORDER BY p.vessel_id, p.base_datetime DESC
     """
     rows = await pool.fetch(query, cutoff)
     return [dict(row) for row in rows]
@@ -61,7 +59,7 @@ async def get_ship_tracks(
 ) -> list[dict]:
     """Return per-ship hourly tracks within a bounding box and date range.
 
-    Positions are snapped to the first AIS fix in each hour. Each ship dict:
+    hourly_positions already holds the first AIS fix in each hour. Each ship dict:
     {mmsi, imo, name, type, positions: [[lon, lat, epochSeconds, sog, cog], ...]}
     """
     pool = get_pool()
@@ -69,17 +67,16 @@ async def get_ship_tracks(
     end_dt = _parse_dt(end_date) + timedelta(days=1)
 
     query = """
-        SELECT DISTINCT ON (p.vessel_id, date_trunc('hour', p.base_datetime))
-               v.mmsi, v.imo, v.vessel_name, v.vessel_type,
+        SELECT v.mmsi, v.imo, v.vessel_name, v.vessel_type,
                ST_X(p.position) AS lon, ST_Y(p.position) AS lat,
-               date_trunc('hour', p.base_datetime) AS hour_bucket,
+               p.hour AS hour_bucket,
                p.sog, p.cog
-        FROM ais_positions p
+        FROM hourly_positions p
         JOIN vessels v ON p.vessel_id = v.id
         WHERE p.position && ST_MakeEnvelope($1, $2, $3, $4, 4326)
-          AND p.base_datetime >= $5
-          AND p.base_datetime < $6
-        ORDER BY p.vessel_id, date_trunc('hour', p.base_datetime), p.base_datetime
+          AND p.hour >= $5
+          AND p.hour < $6
+        ORDER BY p.vessel_id, p.hour
     """
     rows = await pool.fetch(query, min_lon, min_lat, max_lon, max_lat, start_dt, end_dt)
 

@@ -4,6 +4,11 @@ Standalone AISstream WebSocket consumer for deployment on EC2.
 Connects to AISstream, filters to the West Coast bounding box,
 and writes vessel positions to PostgreSQL via psycopg (sync).
 
+Each position message updates three tables in one transaction:
+  - ais_positions_recent: rolling full-resolution window (pruned by export_archive.py)
+  - hourly_positions: first fix per vessel per hour (ON CONFLICT DO NOTHING)
+  - latest_positions: one row per vessel, kept at the newest fix
+
 Usage:
     python -m scripts.stream_worker
 
@@ -65,12 +70,38 @@ def insert_position(
 ):
     cur.execute(
         """
-        INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status)
+        INSERT INTO ais_positions_recent (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status)
         SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s, %s, %s
         FROM vessels v WHERE v.mmsi = %s
         ON CONFLICT (vessel_id, base_datetime) DO NOTHING
         """,
         (timestamp, lon, lat, sog, cog, heading, rate_of_turn, status, mmsi),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO hourly_positions (vessel_id, hour, position, sog, cog)
+        SELECT v.id, date_trunc('hour', %s::timestamp), ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s
+        FROM vessels v WHERE v.mmsi = %s
+        ON CONFLICT (vessel_id, hour) DO NOTHING
+        """,
+        (timestamp, lon, lat, sog, cog, mmsi),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO latest_positions (vessel_id, base_datetime, position, sog, cog, heading)
+        SELECT v.id, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s, %s, %s
+        FROM vessels v WHERE v.mmsi = %s
+        ON CONFLICT (vessel_id) DO UPDATE SET
+            base_datetime = EXCLUDED.base_datetime,
+            position = EXCLUDED.position,
+            sog = EXCLUDED.sog,
+            cog = EXCLUDED.cog,
+            heading = EXCLUDED.heading
+        WHERE EXCLUDED.base_datetime > latest_positions.base_datetime
+        """,
+        (timestamp, lon, lat, sog, cog, heading, mmsi),
     )
 
 
@@ -125,9 +156,10 @@ def run():
 
                         timestamp = parse_timestamp(meta.get("time_utc", ""))
 
-                        with conn.cursor() as cur:
-                            upsert_vessel(cur, mmsi, name)
-                            insert_position(cur, mmsi, lat, lon, sog, cog, heading, rate_of_turn, status, timestamp)
+                        with conn.transaction():
+                            with conn.cursor() as cur:
+                                upsert_vessel(cur, mmsi, name)
+                                insert_position(cur, mmsi, lat, lon, sog, cog, heading, rate_of_turn, status, timestamp)
 
                         batch_count += 1
                         if batch_count % 1000 == 0:
@@ -142,6 +174,7 @@ def run():
         except BaseException as e:
             logger.warning(f"AISstream disconnected: {e} — reconnecting in 5s")
             time.sleep(5)
+    conn.close()
 
 
 if __name__ == "__main__":

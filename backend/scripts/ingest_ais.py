@@ -1,12 +1,19 @@
 """
-CLI tool to download and ingest NOAA MarineCadastre AIS data into PostgreSQL.
+CLI tool to download and ingest NOAA MarineCadastre AIS data.
 
-Uses COPY + staging table with indexes dropped for maximum throughput.
-Downloads are parallelized to keep the network saturated.
+Per day:
+  1. Download the daily zip (with retries).
+  2. Stream-filter rows to the West Coast bounding box (bounded memory).
+  3. Write the full-resolution day to the Parquet archive (S3 or local dir).
+  4. Reduce to the first fix per (vessel, hour) and load vessels + hourly_positions.
+
+Only the hourly reduction enters PostgreSQL; full resolution lives in the archive.
+Daily volume is small enough (~70K hourly rows) that indexes stay in place.
 
 Usage:
-    python -m scripts.ingest_ais --start-date 2023-06-01 --end-date 2023-06-07
-    python -m scripts.ingest_ais --date 2023-06-01
+    python -m scripts.ingest_ais --start-date 2025-01-01 --end-date 2025-12-31 \
+        --archive s3://whalebeing-ais-archive/ais
+    python -m scripts.ingest_ais --date 2025-06-01 --archive /tmp/ais-archive
 """
 
 import argparse
@@ -16,11 +23,19 @@ import sys
 import tempfile
 import time
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import psycopg
+
+from scripts.archive import (
+    batch_from_columns,
+    new_column_buffers,
+    open_writer,
+    parquet_row_count,
+    store_file,
+)
 
 # West Coast bounding box: Baja approaches → Vancouver/BC
 BBOX = {
@@ -32,18 +47,11 @@ BBOX = {
 
 NOAA_URL = "https://coast.noaa.gov/htdata/CMSP/AISDataHandler/{year}/AIS_{year}_{month:02d}_{day:02d}.zip"
 
+PARQUET_FLUSH_ROWS = 250_000
+
 STAGING_DDL = """
-CREATE TEMP TABLE IF NOT EXISTS staging_ais (
+CREATE TEMP TABLE IF NOT EXISTS staging_vessels (
     mmsi BIGINT,
-    base_datetime TEXT,
-    lat DOUBLE PRECISION,
-    lon DOUBLE PRECISION,
-    sog REAL,
-    cog REAL,
-    heading REAL,
-    rot REAL,
-    status INT,
-    transceiver_class TEXT,
     imo TEXT,
     vessel_name TEXT,
     call_sign TEXT,
@@ -53,19 +61,15 @@ CREATE TEMP TABLE IF NOT EXISTS staging_ais (
     draft REAL,
     cargo INT
 );
+CREATE TEMP TABLE IF NOT EXISTS staging_hourly (
+    mmsi BIGINT,
+    hour TIMESTAMP,
+    lon DOUBLE PRECISION,
+    lat DOUBLE PRECISION,
+    sog REAL,
+    cog REAL
+);
 """
-
-INDEXES_TO_DROP = [
-    "idx_positions_geom",
-    "idx_positions_vessel_time",
-    "idx_positions_datetime",
-]
-
-INDEXES_TO_CREATE = [
-    "CREATE INDEX idx_positions_geom ON ais_positions USING GIST (position)",
-    "CREATE INDEX idx_positions_vessel_time ON ais_positions (vessel_id, base_datetime)",
-    "CREATE INDEX idx_positions_datetime ON ais_positions (base_datetime)",
-]
 
 
 def parse_float(val: str) -> float | None:
@@ -113,11 +117,26 @@ def download_day(target_date: date, dest_dir: Path, retries: int = 3) -> tuple[d
     return (target_date, None)
 
 
-def filter_to_tsv(zip_path: Path) -> tuple[io.BytesIO, int, int]:
-    """Read zip, filter to bbox, return TSV bytes buffer + row counts."""
-    buf = io.BytesIO()
+def filter_day(zip_path: Path, parquet_path: Path) -> tuple[dict, dict, int, int]:
+    """Stream the day's CSV: write bbox-filtered rows to Parquet, and reduce in memory.
+
+    Returns (vessels, hourly, kept_rows, total_rows) where
+      vessels: mmsi -> latest non-empty static attributes
+      hourly:  (mmsi, hour) -> (base_datetime, lon, lat, sog, cog) for the first fix
+    """
+    vessels: dict[int, dict] = {}
+    hourly: dict[tuple[int, datetime], tuple] = {}
     total_rows = 0
     kept_rows = 0
+
+    writer = open_writer(parquet_path)
+    cols = new_column_buffers()
+
+    def flush():
+        if cols["mmsi"]:
+            writer.write_batch(batch_from_columns(cols))
+            for buf in cols.values():
+                buf.clear()
 
     with zipfile.ZipFile(zip_path) as zf:
         csv_name = zf.namelist()[0]
@@ -138,62 +157,90 @@ def filter_to_tsv(zip_path: Path) -> tuple[io.BytesIO, int, int]:
                 ):
                     continue
 
-                raw_imo = row.get("IMO") or ""
-                imo = None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo
+                try:
+                    mmsi = int(row["MMSI"])
+                    ts = datetime.fromisoformat(row["BaseDateTime"])
+                except (ValueError, KeyError):
+                    continue
 
-                line = "\t".join([
-                    str(int(row["MMSI"])),
-                    row["BaseDateTime"],
-                    str(lat),
-                    str(lon),
-                    tsv_val(parse_float(row.get("SOG", ""))),
-                    tsv_val(parse_float(row.get("COG", ""))),
-                    tsv_val(parse_float(row.get("Heading", ""))),
-                    tsv_val(parse_float(row.get("ROT", ""))),
-                    tsv_val(parse_int(row.get("Status", ""))),
-                    row.get("TransceiverClass") or "\\N",
-                    tsv_val(imo),
-                    row.get("VesselName") or "\\N",
-                    row.get("CallSign") or "\\N",
-                    tsv_val(parse_int(row.get("VesselType", ""))),
-                    tsv_val(parse_float(row.get("Length", ""))),
-                    tsv_val(parse_float(row.get("Width", ""))),
-                    tsv_val(parse_float(row.get("Draft", ""))),
-                    tsv_val(parse_int(row.get("Cargo", ""))),
-                ]) + "\n"
-                buf.write(line.encode())
+                sog = parse_float(row.get("SOG", ""))
+                cog = parse_float(row.get("COG", ""))
+                heading = parse_float(row.get("Heading", ""))
+                rot = parse_float(row.get("ROT", ""))
+                status = parse_int(row.get("Status", ""))
+
+                cols["mmsi"].append(mmsi)
+                cols["base_datetime"].append(ts)
+                cols["lon"].append(lon)
+                cols["lat"].append(lat)
+                cols["sog"].append(sog)
+                cols["cog"].append(cog)
+                cols["heading"].append(heading)
+                cols["rate_of_turn"].append(rot)
+                cols["status"].append(status)
                 kept_rows += 1
+                if kept_rows % PARQUET_FLUSH_ROWS == 0:
+                    flush()
 
-    buf.seek(0)
-    return buf, kept_rows, total_rows
+                hour = ts.replace(minute=0, second=0, microsecond=0)
+                existing = hourly.get((mmsi, hour))
+                if existing is None or ts < existing[0]:
+                    hourly[(mmsi, hour)] = (ts, lon, lat, sog, cog)
+
+                if mmsi not in vessels:
+                    raw_imo = row.get("IMO") or ""
+                    vessels[mmsi] = {
+                        "imo": None if (not raw_imo or raw_imo == "IMO0000000") else raw_imo,
+                        "vessel_name": row.get("VesselName") or None,
+                        "call_sign": row.get("CallSign") or None,
+                        "vessel_type": parse_int(row.get("VesselType", "")),
+                        "length": parse_float(row.get("Length", "")),
+                        "width": parse_float(row.get("Width", "")),
+                        "draft": parse_float(row.get("Draft", "")),
+                        "cargo": parse_int(row.get("Cargo", "")),
+                    }
+
+    flush()
+    writer.close()
+    return vessels, hourly, kept_rows, total_rows
 
 
-def load_day(conn, target_date: date, zip_path: Path, verbose: bool = True):
-    """Filter and COPY a single day's data into the database."""
-    t0 = time.time()
-
-    tsv_buf, kept_rows, total_rows = filter_to_tsv(zip_path)
-    filter_time = time.time() - t0
-
-    if kept_rows == 0:
-        if verbose:
-            print(f"  {target_date}: no rows in bbox")
-        return
-
-    t1 = time.time()
+def load_day(conn, vessels: dict, hourly: dict):
+    """Load one day's vessels and hourly reduction into PostgreSQL."""
     with conn.transaction():
         cur = conn.cursor()
         cur.execute(STAGING_DDL)
-        cur.execute("TRUNCATE staging_ais")
+        cur.execute("TRUNCATE staging_vessels, staging_hourly")
 
-        with cur.copy("COPY staging_ais FROM STDIN (FORMAT text)") as copy:
-            copy.write(tsv_buf.getvalue())
+        with cur.copy("COPY staging_vessels FROM STDIN (FORMAT text)") as copy:
+            for mmsi, v in vessels.items():
+                copy.write("\t".join([
+                    str(mmsi),
+                    tsv_val(v["imo"]),
+                    tsv_val(v["vessel_name"]),
+                    tsv_val(v["call_sign"]),
+                    tsv_val(v["vessel_type"]),
+                    tsv_val(v["length"]),
+                    tsv_val(v["width"]),
+                    tsv_val(v["draft"]),
+                    tsv_val(v["cargo"]),
+                ]) + "\n")
+
+        with cur.copy("COPY staging_hourly FROM STDIN (FORMAT text)") as copy:
+            for (mmsi, hour), (_, lon, lat, sog, cog) in hourly.items():
+                copy.write("\t".join([
+                    str(mmsi),
+                    hour.isoformat(),
+                    str(lon),
+                    str(lat),
+                    tsv_val(sog),
+                    tsv_val(cog),
+                ]) + "\n")
 
         cur.execute("""
             INSERT INTO vessels (mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo)
-            SELECT DISTINCT ON (mmsi)
-                mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo
-            FROM staging_ais
+            SELECT mmsi, imo, vessel_name, call_sign, vessel_type, length, width, draft, cargo
+            FROM staging_vessels
             ON CONFLICT (mmsi) DO UPDATE SET
                 imo = COALESCE(EXCLUDED.imo, vessels.imo),
                 vessel_name = COALESCE(EXCLUDED.vessel_name, vessels.vessel_name),
@@ -205,52 +252,55 @@ def load_day(conn, target_date: date, zip_path: Path, verbose: bool = True):
         """)
 
         cur.execute("""
-            INSERT INTO ais_positions (vessel_id, base_datetime, position, sog, cog, heading, rate_of_turn, status, transceiver_class)
-            SELECT
-                v.id,
-                s.base_datetime::timestamp,
-                ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326),
-                s.sog, s.cog, s.heading, s.rot, s.status, s.transceiver_class
-            FROM staging_ais s
+            INSERT INTO hourly_positions (vessel_id, hour, position, sog, cog)
+            SELECT v.id, s.hour, ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), s.sog, s.cog
+            FROM staging_hourly s
             JOIN vessels v ON v.mmsi = s.mmsi
-            ON CONFLICT (vessel_id, base_datetime) DO NOTHING
+            ON CONFLICT (vessel_id, hour) DO NOTHING
         """)
 
+
+def ingest_day(conn, target_date: date, zip_path: Path, archive_uri: str, tmp_dir: Path, verbose: bool = True):
+    t0 = time.time()
+
+    parquet_tmp = tmp_dir / f"noaa_{target_date}.parquet"
+    vessels, hourly, kept_rows, total_rows = filter_day(zip_path, parquet_tmp)
+
+    if kept_rows == 0:
+        parquet_tmp.unlink(missing_ok=True)
+        if verbose:
+            print(f"  {target_date}: no rows in bbox")
+        return
+
+    if parquet_row_count(str(parquet_tmp)) != kept_rows:
+        raise RuntimeError(f"{target_date}: Parquet row count mismatch")
+
+    rel_key = (
+        f"source=noaa/year={target_date.year}"
+        f"/month={target_date.month:02d}/day={target_date.day:02d}.parquet"
+    )
+    dest = store_file(parquet_tmp, archive_uri, rel_key)
+    archive_time = time.time() - t0
+
+    t1 = time.time()
+    load_day(conn, vessels, hourly)
     load_time = time.time() - t1
-    total_time = time.time() - t0
 
     if verbose:
-        print(f"  {target_date}: {kept_rows:,}/{total_rows:,} rows — "
-              f"filter:{filter_time:.1f}s load:{load_time:.1f}s total:{total_time:.1f}s")
-
-
-def drop_indexes(conn):
-    """Drop indexes on ais_positions for faster bulk insert."""
-    cur = conn.cursor()
-    for idx in INDEXES_TO_DROP:
-        cur.execute(f"DROP INDEX IF EXISTS {idx}")
-    conn.commit()
-    print("Dropped indexes on ais_positions")
-
-
-def create_indexes(conn):
-    """Recreate indexes on ais_positions after bulk load."""
-    cur = conn.cursor()
-    for ddl in INDEXES_TO_CREATE:
-        print(f"  Creating: {ddl.split(' ON ')[0]}...")
-        t0 = time.time()
-        cur.execute(ddl)
-        conn.commit()
-        print(f"    Done in {time.time() - t0:.1f}s")
-    print("All indexes rebuilt")
+        print(f"  {target_date}: {kept_rows:,}/{total_rows:,} rows → {dest} "
+              f"({len(hourly):,} hourly) — archive:{archive_time:.1f}s load:{load_time:.1f}s")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest NOAA AIS data into PostgreSQL")
+    parser = argparse.ArgumentParser(description="Ingest NOAA AIS data")
     parser.add_argument("--date", type=str, help="Single date to ingest (YYYY-MM-DD)")
     parser.add_argument("--start-date", type=str, help="Start of date range (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="End of date range (YYYY-MM-DD)")
-    parser.add_argument("--no-reindex", action="store_true", help="Skip dropping/recreating indexes")
+    parser.add_argument(
+        "--archive",
+        required=True,
+        help="Archive URI for full-resolution Parquet: s3://bucket/prefix or a local directory",
+    )
     parser.add_argument(
         "--database-url",
         default="postgresql://postgres:postgres@localhost:5432/whalebeing",
@@ -274,10 +324,6 @@ def main():
 
     conn = psycopg.connect(args.database_url)
 
-    # Drop indexes for bulk load speed
-    if not args.no_reindex and len(dates) > 1:
-        drop_indexes(conn)
-
     tmp_dir = Path(tempfile.mkdtemp(prefix="ais_ingest_"))
     print(f"Ingesting {len(dates)} days...")
     sys.stdout.flush()
@@ -292,7 +338,7 @@ def main():
                 print(f"  {d}: skipped (download failed)")
                 days_done += 1
                 continue
-            load_day(conn, d, path)
+            ingest_day(conn, d, path, args.archive, tmp_dir)
             path.unlink(missing_ok=True)
         except Exception as e:
             print(f"  {d}: ERROR — {e}")
@@ -310,16 +356,10 @@ def main():
                   f"{elapsed/60:.1f}min elapsed, ~{remaining/60:.1f}min remaining ---")
             sys.stdout.flush()
 
-    # Rebuild indexes
-    if not args.no_reindex and len(dates) > 1:
-        print("Rebuilding indexes...")
-        create_indexes(conn)
-
     conn.close()
     total_time = time.time() - t_start
     print(f"\nDone! {days_done} days in {total_time/60:.1f} minutes ({total_time/3600:.1f} hours)")
 
-    # Cleanup temp dir
     import shutil
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
